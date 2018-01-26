@@ -3,14 +3,15 @@ package endpoints
 import (
 	"context"
 
+	"encoding/json"
+	"fmt"
 	"github.com/rancher/types/apis/core/v1"
 	"github.com/rancher/types/config"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
-	"encoding/json"
 	"reflect"
-	"fmt"
 )
 
 const (
@@ -23,7 +24,7 @@ type PublicEndpoint struct {
 	NodeIP   string
 	Port     int32
 	Protocol string
-	// for node ip
+	// for node port service
 	ServiceName string
 	// for host port
 	PodName string
@@ -31,18 +32,26 @@ type PublicEndpoint struct {
 }
 
 type EndpointsController struct {
-	nodeController v1.NodeController
+	nodeController    v1.NodeController
 	serviceController v1.ServiceController
 }
 
 type NodesController struct {
 	nodes          v1.NodeInterface
 	endpointLister v1.EndpointsLister
+	serviceLister  v1.ServiceLister
+}
+
+type ServicesController struct {
+	services       v1.ServiceInterface
+	endpointLister v1.EndpointsLister
+	serviceLister  v1.ServiceLister
+	nodeLister     v1.NodeLister
 }
 
 func Register(ctx context.Context, workload *config.WorkloadContext) {
 	e := &EndpointsController{
-		nodeController: workload.Core.Nodes("").Controller(),
+		nodeController:    workload.Core.Nodes("").Controller(),
 		serviceController: workload.Core.Services("").Controller(),
 	}
 	workload.Core.Endpoints("").AddHandler("endpointsController", e.sync)
@@ -50,8 +59,17 @@ func Register(ctx context.Context, workload *config.WorkloadContext) {
 	n := &NodesController{
 		nodes:          workload.Core.Nodes(""),
 		endpointLister: workload.Core.Endpoints("").Controller().Lister(),
+		serviceLister:  workload.Core.Services("").Controller().Lister(),
 	}
 	workload.Core.Nodes("").AddHandler("nodesEndpointsController", n.sync)
+
+	s := &ServicesController{
+		services:       workload.Core.Services(""),
+		endpointLister: workload.Core.Endpoints("").Controller().Lister(),
+		serviceLister:  workload.Core.Services("").Controller().Lister(),
+		nodeLister:     workload.Core.Nodes("").Controller().Lister(),
+	}
+	workload.Core.Nodes("").AddHandler("servicesEndpointsController", s.sync)
 }
 
 func (e *EndpointsController) sync(key string, obj *corev1.Endpoints) error {
@@ -63,7 +81,7 @@ func (e *EndpointsController) sync(key string, obj *corev1.Endpoints) error {
 		if len(nodes) == 0 {
 			return nil
 		}
-		for nodeName, _ := range nodes{
+		for nodeName, _ := range nodes {
 			e.nodeController.Enqueue("", nodeName)
 		}
 		// endpoint.name == service.name
@@ -73,8 +91,48 @@ func (e *EndpointsController) sync(key string, obj *corev1.Endpoints) error {
 	return nil
 }
 
+func (n *ServicesController) sync(key string, obj *corev1.Service) error {
+	if obj == nil || obj.DeletionTimestamp != nil {
+		return nil
+	}
+
+	ep, err := n.endpointLister.Get(obj.Namespace, obj.Name)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if obj.Kind != "NodePort" {
+		return nil
+	}
+	nodes, err := n.nodeLister.List("".labels.NewSelector())
+	if err != nil {
+		return err
+	}
+	newPublicEps, err := convertEndpointToPublicEndpoints(ep, nodes, obj)
+	if err != nil {
+		return err
+	}
+
+	existingPublicEps := getPublicEndpointsFromAnnotations(obj.Annotations)
+	if areEqualEndpoints(existingPublicEps, newPublicEps) {
+		return nil
+	}
+	toUpdate := obj.DeepCopy()
+	epsToUpdate, err := publicEndpointsToString(newPublicEps)
+	if err != nil {
+		return err
+	}
+	logrus.Infof("Updating service [%s] with public endpoints [%v]", key, epsToUpdate)
+	toUpdate.Annotations[endpointsAnnotation] = epsToUpdate
+	_, err = n.services.Update(toUpdate)
+
+	return nil
+}
+
 func (n *NodesController) sync(key string, obj *corev1.Node) error {
-	if obj == nil {
+	if obj == nil || obj.DeletionTimestamp != nil {
 		return nil
 	}
 
@@ -84,14 +142,24 @@ func (n *NodesController) sync(key string, obj *corev1.Node) error {
 	}
 	var newPublicEps []PublicEndpoint
 	for _, ep := range eps {
-		pEps := convertEndpointToNodePublicEndpoint(ep, obj)
+		svc, err := n.serviceLister.Get(ep.Namespace, ep.Name)
+		if err != nil {
+			if errors.IsNotFound(err) {
+				continue
+			}
+			return err
+		}
+		pEps, err := convertEndpointToPublicEndpoints(ep, []*corev1.Node{obj}, svc)
+		if err != nil {
+			return err
+		}
 		if len(pEps) == 0 {
 			continue
 		}
 		newPublicEps = append(newPublicEps, pEps...)
 	}
 
-	existingPublicEps := getPublicEndpointsFromNode(obj)
+	existingPublicEps := getPublicEndpointsFromAnnotations(obj.Annotations)
 	if areEqualEndpoints(existingPublicEps, newPublicEps) {
 		return nil
 	}
@@ -127,12 +195,12 @@ func publicEndpointsToString(eps []PublicEndpoint) (string, error) {
 	return string(b), nil
 }
 
-func getPublicEndpointsFromNode(node *corev1.Node) []PublicEndpoint {
+func getPublicEndpointsFromAnnotations(annotations map[string]string) []PublicEndpoint {
 	var eps []PublicEndpoint
-	if node.Annotations == nil {
+	if annotations == nil {
 		return eps
 	}
-	if val, ok := node.Annotations[endpointsAnnotation]; ok {
+	if val, ok := annotations[endpointsAnnotation]; ok {
 		err := json.Unmarshal([]byte(val), &eps)
 		if err != nil {
 			logrus.Errorf("Failed to read public endpoints from annotation %v", err)
@@ -141,7 +209,6 @@ func getPublicEndpointsFromNode(node *corev1.Node) []PublicEndpoint {
 	}
 	return eps
 }
-
 func getNodesToUpdate(ep *corev1.Endpoints) map[string]bool {
 	nodeNames := make(map[string]bool)
 	for _, s := range ep.Subsets {
@@ -155,47 +222,56 @@ func getNodesToUpdate(ep *corev1.Endpoints) map[string]bool {
 	return nodeNames
 }
 
-func convertEndpointToNodePublicEndpoint(ep *corev1.Endpoints, node *corev1.Node) []PublicEndpoint {
+func convertEndpointToPublicEndpoints(ep *corev1.Endpoints, nodes []*corev1.Node, svc *corev1.Service) ([]PublicEndpoint, error) {
 	var eps []PublicEndpoint
-	nodeName := node.Name
-	nodeIp := ""
-	if val, ok := node.Annotations["alpha.kubernetes.io/provided-node-ip"]; ok {
-		nodeIp = string(val)
-	}
-	if nodeIp == "" {
-		logrus.Warnf("Node [%s] has no ip address set", nodeName)
-		return eps
-	}
+	nodeNameToIp := make(map[string]string)
 
+	// figure out on which nodes the service is deployed
 	for _, s := range ep.Subsets {
-		found := false
 		for _, addr := range s.Addresses {
 			if addr.NodeName == nil {
 				continue
 			}
-			if *addr.NodeName == nodeName {
-				found = true
-				break
+			nodeName := *addr.NodeName
+			if _, ok := nodeNameToIp[nodeName]; ok {
+				continue
 			}
-		}
-		if found {
-			for _, port := range s.Ports {
-				p := PublicEndpoint{
-					NodeName:    node.Name,
-					NodeIP:      nodeIp,
-					Port:        port.Port,
-					Protocol:    string(port.Protocol),
-					ServiceName: ep.Name,
+			for _, node := range nodes {
+				if nodeName == node.Name {
+					if val, ok := node.Annotations["alpha.kubernetes.io/provided-node-ip"]; ok {
+						nodeIp := string(val)
+						if nodeIp == "" {
+							logrus.Warnf("Node [%s] has no ip address set", nodeName)
+						} else {
+							nodeNameToIp[nodeName] = nodeIp
+						}
+						break
+					}
+
 				}
-				eps = append(eps, p)
 			}
 		}
 	}
 
-	return eps
+	for nodeName, nodeIp := range nodeNameToIp {
+		for _, port := range svc.Spec.Ports {
+			if port.NodePort == 0 {
+				continue
+			}
+			p := PublicEndpoint{
+				NodeName:    nodeName,
+				NodeIP:      nodeIp,
+				Port:        port.NodePort,
+				Protocol:    string(port.Protocol),
+				ServiceName: ep.Name,
+			}
+			eps = append(eps, p)
+		}
+	}
+
+	return eps, nil
 }
 
-
-func (p PublicEndpoint)string() string {
+func (p PublicEndpoint) string() string {
 	return fmt.Sprintf("%s_%s_%s_%s_%s_%s", p.NodeName, p.NodeIP, p.Port, p.Protocol, p.ServiceName, p.PodName)
 }
