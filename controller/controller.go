@@ -7,9 +7,10 @@ import (
 	"github.com/rancher/types/apis/project.cattle.io/v3/schema"
 	"github.com/rancher/types/client/project/v3"
 	"github.com/rancher/types/config"
-	"github.com/rancher/workload-controller/controller/dnsrecord"
-	"github.com/rancher/workload-controller/controller/workload"
-	"github.com/rancher/workload-controller/controller/workloadservice"
+	//"github.com/rancher/workload-controller/controller/dnsrecord"
+	//"github.com/rancher/workload-controller/controller/workload"
+	//"github.com/rancher/workload-controller/controller/workloadservice"
+	"github.com/rancher/workload-controller/controller/endpoints"
 )
 
 func Register(ctx context.Context, workloadContext *config.WorkloadContext) error {
@@ -22,10 +23,11 @@ func Register(ctx context.Context, workloadContext *config.WorkloadContext) erro
 		return err
 	}
 
-	workload.Register(ctx, workloadContext)
-
-	dnsrecord.Register(ctx, workloadContext)
-	workloadservice.Register(ctx, workloadContext)
+	//workload.Register(ctx, workloadContext)
+	//
+	//dnsrecord.Register(ctx, workloadContext)
+	//workloadservice.Register(ctx, workloadContext)
+	endpoints.Register(ctx, workloadContext)
 
 	return nil
 }
