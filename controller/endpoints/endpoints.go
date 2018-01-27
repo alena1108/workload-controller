@@ -9,13 +9,12 @@ import (
 	"github.com/rancher/types/config"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	"reflect"
 )
 
 const (
-	allNodes            = "_all_nodes_"
+	allEndpoints        = "_all_endpoints_"
 	endpointsAnnotation = "field.cattle.io/publicEndpoints"
 )
 
@@ -31,86 +30,62 @@ type PublicEndpoint struct {
 	//serviceName and podName are mutually exclusive
 }
 
-type EndpointsController struct {
-	nodeController    v1.NodeController
-	serviceController v1.ServiceController
-}
-
 type NodesController struct {
-	nodes          v1.NodeInterface
-	endpointLister v1.EndpointsLister
-	serviceLister  v1.ServiceLister
+	nodes             v1.NodeInterface
+	serviceLister     v1.ServiceLister
+	serviceController v1.ServiceController
 }
 
 type ServicesController struct {
 	services       v1.ServiceInterface
-	endpointLister v1.EndpointsLister
 	serviceLister  v1.ServiceLister
 	nodeLister     v1.NodeLister
+	nodeController v1.NodeController
 }
 
 func Register(ctx context.Context, workload *config.WorkloadContext) {
-	e := &EndpointsController{
-		nodeController:    workload.Core.Nodes("").Controller(),
-		serviceController: workload.Core.Services("").Controller(),
-	}
-	workload.Core.Endpoints("").AddHandler("endpointsController", e.sync)
-
 	n := &NodesController{
-		nodes:          workload.Core.Nodes(""),
-		endpointLister: workload.Core.Endpoints("").Controller().Lister(),
-		serviceLister:  workload.Core.Services("").Controller().Lister(),
+		nodes:             workload.Core.Nodes(""),
+		serviceLister:     workload.Core.Services("").Controller().Lister(),
+		serviceController: workload.Core.Services("").Controller(),
 	}
 	workload.Core.Nodes("").AddHandler("nodesEndpointsController", n.sync)
 
 	s := &ServicesController{
 		services:       workload.Core.Services(""),
-		endpointLister: workload.Core.Endpoints("").Controller().Lister(),
 		serviceLister:  workload.Core.Services("").Controller().Lister(),
 		nodeLister:     workload.Core.Nodes("").Controller().Lister(),
+		nodeController: workload.Core.Nodes("").Controller(),
 	}
-	workload.Core.Nodes("").AddHandler("servicesEndpointsController", s.sync)
+	workload.Core.Services("").AddHandler("servicesEndpointsController", s.sync)
 }
 
-func (e *EndpointsController) sync(key string, obj *corev1.Endpoints) error {
+func (s *ServicesController) sync(key string, obj *corev1.Service) error {
 	if obj == nil {
-		// schedule upate for all nodes
-		e.nodeController.Enqueue("", allNodes)
-	} else {
-		nodes := getNodesToUpdate(obj)
-		if len(nodes) == 0 {
-			return nil
-		}
-		for nodeName, _ := range nodes {
-			e.nodeController.Enqueue("", nodeName)
-		}
-		// endpoint.name == service.name
-		e.serviceController.Enqueue(obj.Namespace, obj.Name)
-	}
-
-	return nil
-}
-
-func (n *ServicesController) sync(key string, obj *corev1.Service) error {
-	if obj == nil || obj.DeletionTimestamp != nil {
 		return nil
 	}
 
-	ep, err := n.endpointLister.Get(obj.Namespace, obj.Name)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			return nil
-		}
-		return err
-	}
-	if obj.Kind != "NodePort" {
+	if obj.Spec.Type != "NodePort" {
 		return nil
 	}
-	nodes, err := n.nodeLister.List("".labels.NewSelector())
+
+	nodes, err := s.nodeLister.List("", labels.NewSelector())
 	if err != nil {
 		return err
 	}
-	newPublicEps, err := convertEndpointToPublicEndpoints(ep, nodes, obj)
+
+	if obj.DeletionTimestamp != nil {
+		// push changes to all the nodes
+		for _, node := range nodes {
+			if node.DeletionTimestamp == nil {
+				s.nodeController.Enqueue("", node.Name)
+			}
+		}
+		return nil
+	}
+
+	// 1. update service with endpoints
+	newPublicEps, err := convertServiceToPublicEndpoints(nodes, obj)
 	if err != nil {
 		return err
 	}
@@ -124,32 +99,57 @@ func (n *ServicesController) sync(key string, obj *corev1.Service) error {
 	if err != nil {
 		return err
 	}
+
 	logrus.Infof("Updating service [%s] with public endpoints [%v]", key, epsToUpdate)
+	if toUpdate.Annotations == nil {
+		toUpdate.Annotations = make(map[string]string)
+	}
 	toUpdate.Annotations[endpointsAnnotation] = epsToUpdate
-	_, err = n.services.Update(toUpdate)
+	_, err = s.services.Update(toUpdate)
+	if err != nil {
+		return err
+	}
+	// 2. push changes to all the nodes (only in case service got an update!)
+	for _, node := range nodes {
+		if node.DeletionTimestamp == nil {
+			s.nodeController.Enqueue("", node.Name)
+		}
+	}
 
 	return nil
 }
 
 func (n *NodesController) sync(key string, obj *corev1.Node) error {
-	if obj == nil || obj.DeletionTimestamp != nil {
+	if obj == nil {
 		return nil
 	}
 
-	eps, err := n.endpointLister.List("", labels.NewSelector())
+	svcs, err := n.serviceLister.List("", labels.NewSelector())
 	if err != nil {
 		return err
 	}
-	var newPublicEps []PublicEndpoint
-	for _, ep := range eps {
-		svc, err := n.serviceLister.Get(ep.Namespace, ep.Name)
-		if err != nil {
-			if errors.IsNotFound(err) {
-				continue
-			}
-			return err
+
+	var nodePortSvcs []*corev1.Service
+	for _, svc := range svcs {
+		if svc.DeletionTimestamp != nil {
+			continue
 		}
-		pEps, err := convertEndpointToPublicEndpoints(ep, []*corev1.Node{obj}, svc)
+		if svc.Spec.Type == "NodePort" {
+			nodePortSvcs = append(nodePortSvcs, svc)
+		}
+	}
+
+	if obj.DeletionTimestamp != nil {
+		// push changes to all services
+		for _, svc := range nodePortSvcs {
+			n.serviceController.Enqueue(svc.Namespace, svc.Name)
+		}
+		return nil
+	}
+
+	var newPublicEps []PublicEndpoint
+	for _, svc := range nodePortSvcs {
+		pEps, err := convertServiceToPublicEndpoints([]*corev1.Node{obj}, svc)
 		if err != nil {
 			return err
 		}
@@ -159,6 +159,7 @@ func (n *NodesController) sync(key string, obj *corev1.Node) error {
 		newPublicEps = append(newPublicEps, pEps...)
 	}
 
+	// 1. update node with endpoints
 	existingPublicEps := getPublicEndpointsFromAnnotations(obj.Annotations)
 	if areEqualEndpoints(existingPublicEps, newPublicEps) {
 		return nil
@@ -169,8 +170,16 @@ func (n *NodesController) sync(key string, obj *corev1.Node) error {
 		return err
 	}
 	logrus.Infof("Updating node [%s] with public endpoints [%v]", key, epsToUpdate)
+	if toUpdate.Annotations == nil {
+		toUpdate.Annotations = make(map[string]string)
+	}
 	toUpdate.Annotations[endpointsAnnotation] = epsToUpdate
 	_, err = n.nodes.Update(toUpdate)
+
+	// 2. push changes to the svcs (only when node info changed)
+	for _, svc := range nodePortSvcs {
+		n.serviceController.Enqueue(svc.Namespace, svc.Name)
+	}
 
 	return err
 }
@@ -222,33 +231,17 @@ func getNodesToUpdate(ep *corev1.Endpoints) map[string]bool {
 	return nodeNames
 }
 
-func convertEndpointToPublicEndpoints(ep *corev1.Endpoints, nodes []*corev1.Node, svc *corev1.Service) ([]PublicEndpoint, error) {
+func convertServiceToPublicEndpoints(nodes []*corev1.Node, svc *corev1.Service) ([]PublicEndpoint, error) {
 	var eps []PublicEndpoint
 	nodeNameToIp := make(map[string]string)
 
-	// figure out on which nodes the service is deployed
-	for _, s := range ep.Subsets {
-		for _, addr := range s.Addresses {
-			if addr.NodeName == nil {
-				continue
-			}
-			nodeName := *addr.NodeName
-			if _, ok := nodeNameToIp[nodeName]; ok {
-				continue
-			}
-			for _, node := range nodes {
-				if nodeName == node.Name {
-					if val, ok := node.Annotations["alpha.kubernetes.io/provided-node-ip"]; ok {
-						nodeIp := string(val)
-						if nodeIp == "" {
-							logrus.Warnf("Node [%s] has no ip address set", nodeName)
-						} else {
-							nodeNameToIp[nodeName] = nodeIp
-						}
-						break
-					}
-
-				}
+	for _, node := range nodes {
+		if val, ok := node.Annotations["alpha.kubernetes.io/provided-node-ip"]; ok {
+			nodeIp := string(val)
+			if nodeIp == "" {
+				logrus.Warnf("Node [%s] has no ip address set", node.Name)
+			} else {
+				nodeNameToIp[node.Name] = nodeIp
 			}
 		}
 	}
@@ -263,7 +256,7 @@ func convertEndpointToPublicEndpoints(ep *corev1.Endpoints, nodes []*corev1.Node
 				NodeIP:      nodeIp,
 				Port:        port.NodePort,
 				Protocol:    string(port.Protocol),
-				ServiceName: ep.Name,
+				ServiceName: svc.Name,
 			}
 			eps = append(eps, p)
 		}
